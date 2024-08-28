@@ -1,0 +1,17 @@
+<assembly>
+	<formats>
+		<format>zip</format>
+	</formats>
+	<includeBaseDirectory>false</includeBaseDirectory>
+	<fileSets>
+		<fileSet>
+			<directory>src/main/resources</directory>
+			<outputDirectory>/</outputDirectory>
+			<includes>
+				<include>*</include>
+			</includes>
+			<fileMode>0750</fileMode>
+			<lineEnding>unix</lineEnding>
+		</fileSet>
+	</fileSets>
+</assembly>

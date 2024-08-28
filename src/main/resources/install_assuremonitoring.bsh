@@ -1,0 +1,624 @@
+#!/bin/bash
+#--------------------------------------------------------------------------
+# COPYRIGHT Ericsson 2015
+#
+# The copyright to the computer program(s) herein is the property of
+# Ericsson Inc. The programs may be used and/or copied only with written
+# permission from Ericsson Inc. or in accordance with the terms and
+# conditions stipulated in the agreement/contract under which the
+# program(s) have been supplied.
+#--------------------------------------------------------------------------
+
+#-------------------------------------------------------------------------
+# Name    : install_assuremonitoring.bsh
+# Date    : 29/08/2014
+# Revision: 1.2
+# Purpose : This script will be used to install/upgrade the assuremonitoring package.
+#           On OSS Monitoring (hyperic) server (hosted on MWS), the latest package should only be available.
+#           Hence, script upgrades assuremonitoring package on OSS MT Server.
+#           On OSS Monitoring (hyperic) agent, the script (re-)installs the assuremonitoring package.
+#
+#--------------------------------------------------------------------------
+# Date    : 13/04/2015
+# Revision: 1.3
+# Purpose : The script was skipping upgrade of the assuremonitoring package on OSS MT Server even if higher version is available.
+#           This revision is added to handle this bug.
+#           Hence, the script upgrades the assuremonitoring package on OSS MT Server if lower version is installed.
+#           The script skips upgrade if/same higher version is already installed.
+#--------------------------------------------------------------------------
+# Usage   : install_assuremonitoring.bsh -d <PACKAGE DIRECTORY> ] [ -p <PACKAGE NAME> ] [ -l <LOGFILE> ] [-h]
+#--------------------------------------------------------------------------
+# GLOBAL COMMAND SECTION
+#--------------------------------------------------------------------------
+
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CHMOD=/usr/bin/chmod
+CLEAR=/usr/bin/clear
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO=/usr/bin/echo
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+PKGADD=/usr/sbin/pkgadd
+PKGINFO=/usr/bin/pkginfo
+PKGRM=/usr/sbin/pkgrm
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+UNAME=/usr/bin/uname
+WC=/usr/bin/wc
+
+#--------------------------------------------------------------------------
+# GLOBAL SCRIPT VARIABLES
+#--------------------------------------------------------------------------
+
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+SUPPORTED_PLATFORM=SunOS
+DEFAULT_USER=root
+PACKAGE_NAME=assuremonitoring
+
+TEMP_DIR=/tmp/assuremonitoring
+SW_ADM=assuremon.sw.adm
+SW_RES=assuremon.sw.res
+
+SCRIPT=`$BASENAME $0`
+SCRIPT_DIR=`$DIRNAME $0`
+
+LOGDIR=/var/log/hyperic/assuremonitoring
+LOGFILE="${LOGDIR}/${SCRIPT}.log"
+NUM_OF_LOG=10
+
+HYPERIC_SERVER_PACKAGE=ERICmonsrv
+HYPERIC_AGENT_PACKAGE=ERICmonagt
+
+SKIP_UPGRADE=0
+
+#--------------------------------------------------------------------------
+# FUNCTIONS
+#--------------------------------------------------------------------------
+
+### Function: init_log ###
+#
+#   - Creates the log directory, if needed.
+#   - Rotates the log, if already present.
+#   - Create a new log file with appropriate permission
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+
+init_log() {
+   local _log_file_dir_=`${DIRNAME} ${LOGFILE}`
+   if [ ! -d "${_log_file_dir_}" ]; then
+      $MKDIR -p ${_log_file_dir_}
+      if [ $? -ne 0 ]; then
+         $ECHO "ERROR: Unable to create directory ${_log_file_dir_} for logfile ${LOGFILE}"
+         exit 1
+      fi
+   fi
+
+   rotate_log
+
+   $TOUCH ${LOGFILE}
+   $CHMOD 755 ${LOGFILE}
+   info_msg "${SCRIPT} Started on ${RUN_TIME}."
+}
+
+### Function: rotate_log ###
+#
+#   - Rotates the logfile upto the maximum number of logs.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+
+rotate_log() {
+   local _new_num_=""
+   for (( _new_num_=${NUM_OF_LOG}-1; _new_num_>=1; _new_num_--)) {
+      local _curr_num_=`expr ${_new_num_} - 1`
+      if [ -f "$LOGFILE.${_curr_num_}" ]; then
+         $MV $LOGFILE.${_curr_num_} $LOGFILE.${_new_num_}
+      fi
+   }
+
+   if [ -f "$LOGFILE" ]; then
+      $MV $LOGFILE $LOGFILE.0
+   fi
+}
+
+### Function: info_msg ###
+#
+#   - Prints the info message and logs the same.
+#
+# Arguments:
+#       info message
+# Return Values:
+#       none
+
+info_msg() {
+  $ECHO "INFO: $1" | $TEE -a ${LOGFILE}
+}
+
+### Function: crash_script ###
+#
+#   - Prints the error message and logs the same.
+#   - Cleans up temporary files.
+#   - Abort the script execution with return value of 1.
+#
+# Arguments:
+#       error message
+# Return Values:
+#       1
+
+crash_script() {
+  cleanup_tmp_file
+  $ECHO "ERROR: $1" | $TEE -a ${LOGFILE}
+  exit 1
+}
+
+### Function: create_adm_file ###
+#
+#   - Create adm file for silent pkg install.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+
+create_adm_file() {
+   info_msg "Creating ${TEMP_DIR}/${SW_ADM}."
+$ECHO "mail=
+instance=unique
+partial=nocheck
+runlevel=nocheck
+idepend=nocheck
+rdepend=nocheck
+space=nocheck
+setuid=nocheck
+conflict=nocheck
+action=nocheck
+basedir=default
+" > ${TEMP_DIR}/${SW_ADM}
+
+}
+
+### Function: compare_package_string ###
+#
+#   This function
+#   - Compares the new available and installed
+#     package version when length of both the strings are same.
+#     If installed package version is higher then
+#     sets SKIP_UPGRADE flag to 1 giving INFO messages
+#     and skips upgrade.
+#
+# Arguments:
+#       $1 : new available package version
+#       $2 : installed package version
+# Return Values:
+#       none
+
+compare_package_string() {
+   local _available_version_=$1
+   local _installed_version_=$2
+   if [ $(expr ${_installed_version_} \== ${_available_version_}) -eq 1 ]; then
+      info_msg "Version of $PACKAGE_NAME package in $INSTALL_PACKAGE is same as the current installed version."
+      info_msg "Re-installing the $PACKAGE_NAME package from $INSTALL_PACKAGE."
+   elif [ $(expr ${_installed_version_} \> ${_available_version_}) -eq 1 ]; then
+      info_msg "Skip upgrade as the current version of $PACKAGE_NAME package is greater than the version in $INSTALL_PACKAGE."
+      SKIP_UPGRADE=1
+   elif [ $(expr ${_installed_version_} \< ${_available_version_}) -eq 1 ]; then
+      info_msg "Upgrading the $PACKAGE_NAME package to ${_available_version_}."
+   fi
+}
+
+### Function: compare_package_version ###
+#
+#   This function
+#   - Compares each character of the new and install package version
+#     to get the latest version between the two.
+#
+# Arguments:
+# $1 : new version
+# $2 : installed version
+#
+# Return Values:
+#      none
+
+compare_package_version() {
+   local _new_version_=$1
+   local _install_version_=$2
+   local _new_version_chars_=""
+   local _install_version_chars_=""
+   local _new_version_num_=""
+   local _install_version_num_=""
+
+   if [ $(expr ${#_new_version_} \!= ${#_install_version_}) -eq 1 ]; then
+     # If the string length of _new_version_ and _install_version_ are not same
+     # compare the chars/nums of each string.
+      _new_version_chars_=$($ECHO ${_new_version_} | $SED "s/[^A-Z]//g")
+      _install_version_chars_=$($ECHO ${_install_version_} | $SED "s/[^A-Z]//g")
+      if [ $(expr ${_new_version_chars_} \== ${_install_version_chars_}) -eq 1 ]; then
+         #Need to compare numbers as alphabets are same in both the strings.
+         _new_version_num_=$($ECHO ${_new_version_} | $ECHO "s/[^0-9]//g")
+         _install_version_num_=$($ECHO ${_install_version_} | $ECHO "s/[^0-9]//g")
+         compare_package_string ${_new_version_num_} ${_install_version_num_}
+      else
+         #Need to compare characters of both the strings.
+         compare_package_string ${_new_version_chars_} ${_install_version_chars_}
+      fi
+   else
+      # If the string length of _new_version_ and _install_version_ are same
+      # compare both the strings to get the latest package.
+      compare_package_string ${_new_version_} ${_install_version_}
+   fi
+}
+
+
+### Function: create_res_file ###
+#
+#   This function
+#   - Create response file for silent pkg install.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+
+create_res_file() {
+   info_msg "Creating ${TEMP_DIR}/${SW_RES}."
+   $ECHO "y" > ${TEMP_DIR}/${SW_RES}
+}
+
+### Function: create_tmp_file ###
+#
+#   This function
+#   - Cleans any previous temporary files.
+#   - Creates the temporary file directory.
+#   - Create adm file.
+#   - Create res file.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+
+create_tmp_file() {
+   cleanup_tmp_file
+   $MKDIR -p $TEMP_DIR
+   create_adm_file
+   create_res_file
+}
+
+### Function: cleanup_tmp_file ###
+#
+#   - Cleans up the temporary directory.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+
+cleanup_tmp_file() {
+   $RM -rf ${TEMP_DIR}
+}
+
+### Function: validate_package_version ###
+#
+#   This function
+#   - Checks the new and installed package version names.
+#   - Calls appropriate functions based on the naming conventions to
+#     get the latest version of package.
+#
+# Arguments:
+#     None
+#
+# Return Values:
+#       none
+
+validate_package_version () {
+   local _new_package_name_=$1
+   local _install_package_name_=$2
+   local _new_package_version_length_=${#_new_package_name_}
+   local _install_package_version_length_=${#_install_package_name_}
+   local _ec_available_=0
+   local _ec_name_new_package_=""
+   local _ec_name_install_package_=""
+
+   #check if package version is an EC.
+   if [[ "${_new_package_name_}" =~ [^a-zA-Z0-9\ ] ]]; then
+      _ec_available_=$(expr ${_ec_available_} + 1)
+   fi
+   if [[ "${_install_package_name_}" =~ [^a-zA-Z0-9\ ] ]]; then
+      _ec_available_=$(expr ${_ec_available_} + 1)
+   fi
+
+   #Comparing install and new version of assure monitoring package, when the version string length is different
+   if [[ "${_ec_available_}" -ne 0 ]]; then
+      if [[ "${_ec_available_}" -eq 2 ]]; then
+         _ec_name_new_package_=$($ECHO ${_new_package_name_} | $SED "s/\_//g")
+         _ec_name_install_package_=$($ECHO $_install_package_name_ | $SED "s/\_//g")
+         compare_package_version ${_ec_name_new_package_} ${_ec_name_install_package_}
+      elif [[ "${_ec_available_}" -eq 1 ]] ; then
+         _ec_name_new_package_=$($ECHO ${_new_package_name_} | $AWK -F"_" '{print $1}')
+         _ec_name_install_package_=$($ECHO ${_install_package_name_} | $AWK -F"_" '{print $1}')
+         if [ $(expr ${_ec_name_new_package_} \== ${_ec_name_install_package_}) -eq 1 ]; then
+            if [ $(expr ${#_new_package_name_} \>  ${#_install_package_name_}) -eq 1 ]; then
+               info_msg "Upgrading the $PACKAGE_NAME package to ${_new_package_name_}."
+            elif [ $(expr ${#_new_package_name_} \<  ${#_install_package_name_}) -eq 1 ]; then
+               info_msg "Skip upgrade as the current version of $PACKAGE_NAME package is greater than the version in $INSTALL_PACKAGE." 
+               SKIP_UPGRADE=1
+            fi
+         else
+            compare_package_version ${_ec_name_new_package_} ${_ec_name_install_package_}
+         fi
+      fi
+   elif [ ${_new_package_version_length_} \== ${_install_package_version_length_} ]; then
+      compare_package_string ${_new_package_name_} ${_install_package_name_}
+   elif [ ${_new_package_version_length_} \!= ${_install_package_version_length_} ]; then
+      compare_package_version ${_new_package_version_} ${_install_package_version_}
+   fi
+}
+
+### Function: remove_package ###
+#
+#   This function
+#   - Removes the currently installed package, if present.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+
+remove_package() {
+   info_msg "Checking if the $PACKAGE_NAME package is already installed."
+   $PKGINFO -q $PACKAGE_NAME
+   if [ $? -ne 0 ]; then
+      info_msg "Skip the uninstall procedure as $PACKAGE_NAME package is not installed."
+   else
+      info_msg "Package $PACKAGE_NAME is currently installed."
+      info_msg "Removing the existing $PACKAGE_NAME package."
+      $PKGRM -n -a ${TEMP_DIR}/${SW_ADM} $PACKAGE_NAME
+      if [ $? -ne 0 ]; then
+         crash_script "Failed to uninstall $PACKAGE_NAME package."
+      else
+         info_msg "Sucessfully uninstalled $PACKAGE_NAME package."
+      fi
+   fi
+}
+
+### Function: add_package ###
+#
+#   - Silently adds the package.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+
+add_package() {
+   info_msg "Installing the package ${INSTALL_PACKAGE}."
+   $PKGADD -n -d ${INSTALL_PACKAGE} -r ${TEMP_DIR}/${SW_RES} -a ${TEMP_DIR}/${SW_ADM} all
+   if [ $? -ne 0 ]; then
+      crash_script "Failed to install $PACKAGE_NAME package from ${INSTALL_PACKAGE}."
+   else
+      info_msg "Sucessfully installed $PACKAGE_NAME package from ${INSTALL_PACKAGE}."
+   fi
+}
+
+### Function: validate_install_package ###
+#
+#   - Checks if  the package file contains the same package as currently installed.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+
+validate_install_package() {
+   info_msg "Validating the file $INSTALL_PACKAGE for $PACKAGE_NAME package."
+   local _package_name_=`$HEAD $INSTALL_PACKAGE | $GREP "PKG=" | $AWK -F"=" '{print $NF}'`
+   if [ "${_package_name_}" == "${PACKAGE_NAME}" ]; then
+      info_msg "File $INSTALL_PACKAGE is valid for $PACKAGE_NAME package."
+   else
+       crash_script "Failed to validate file $INSTALL_PACKAGE for $PACKAGE_NAME package."
+   fi
+}
+
+### Function: validate_platform ###
+#
+#   This function validates the supported platform.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+
+validate_platform() {
+   local _local_platform_=`$UNAME -s`
+   if [ "${_local_platform_}" != "${SUPPORTED_PLATFORM}" ]; then
+      crash_script "${_local_platform_} is not a supported platform for $SCRIPT."
+   fi
+}
+
+### Function: validate_userid ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+
+validate_userid() {
+   local _check_id_=`$ID | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+   if [ "$_check_id_" != "$1" ]; then
+      crash_script "You must be $1 to execute this script."
+   fi
+}
+
+### Function: set_procedure ###
+#
+#   Set the procedure based on hyperic server / agent installation.
+#   - If hyperic server is present, we are on MWS.
+#     On MWS, we only upgrade, unless its first time installation.
+#   - If only hyperic agent is present, we (re)install as we are on ENIQ.
+#     On ENIQ, we always upgrade.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+
+set_procedure() {
+   info_msg "Checking for OSS Monitoring Tool packages."
+   $PKGINFO -q ${HYPERIC_SERVER_PACKAGE}
+   if [ $? -eq 0 ]; then
+      info_msg "Found OSS Monitoring Server."
+      $PKGINFO -q $PACKAGE_NAME
+      if [ $? -eq 0 ]; then
+         UPGRADE="YES"
+      else
+         INSTALL="YES"
+      fi
+   else
+      $PKGINFO -q ${HYPERIC_AGENT_PACKAGE}
+      if [ $? -eq 0 ]; then
+         INSTALL="YES"
+         info_msg "Found OSS Monitoring Agent."
+      else
+         crash_script "Installation of $PACKAGE_NAME package requires prior installation of OSS Monitoring Tool."
+      fi
+   fi
+}
+
+### Function: usage_msg ###
+#
+#   This function prints the usage message.
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+
+usage_msg() {
+   $ECHO "
+Usage: $SCRIPT [ -d <PACKAGE DIRECTORY> ] [ -p <PACKAGE NAME> ] [ -l <LOGFILE> ] [-h]
+
+options:
+
+-d  : Optional parameter specifying the path of directory where assuremonitoring
+      package is present.
+      Default value will be the present workding directory of the script.
+
+-p  : Optional parameter specifying the complete name of package.
+      If not specified, then script will look for only one package with name
+      assuremonitoring in the directory <PACKAGE DIRECTORY>.
+
+-l  : Optional parameter specifying the logfile.
+      If specified, the logs will be appended to the logfile.
+      Default is ${LOGFILE}.
+
+-h  : Optional parameter for displaying usage.
+"
+}
+
+#--------------------------------------------------------------------------
+# Main body of script.
+#--------------------------------------------------------------------------
+
+while getopts ":d:p:l:h" arg; do
+  case $arg in
+    d) PACKAGE_DIR="$OPTARG"
+       ;;
+    p) INSTALL_PACKAGE_NAME="$OPTARG"
+       ;;
+    l) OPT_LOGFILE="$OPTARG"
+       ;;
+    h) HELP="YES"
+       ;;
+   \?) crash_script "Incorrect Option: $arg"
+       ;;
+  esac
+done
+
+if [ "${HELP}" ]; then
+   usage_msg
+   exit 0
+fi
+
+if [ "${OPT_LOGFILE}" ]; then
+   LOGFILE=${OPT_LOGFILE}
+else
+   init_log
+fi
+
+validate_platform
+validate_userid $DEFAULT_USER
+set_procedure
+
+# Initialize the package directory.
+if [ ! "${PACKAGE_DIR}" ]; then
+   PACKAGE_DIR=${SCRIPT_DIR}
+elif [ ! -d "${PACKAGE_DIR}" ]; then
+   crash_script "Unable to find the directory ${PACKAGE_DIR}."
+fi
+
+# Initialize the package name with complete path.
+# If the package name is not provided from command line argument, find only one package name from the PACKAGE DIR.
+# If the package name is provided from command line, verify if the package is present.
+
+
+if [ ! "${INSTALL_PACKAGE_NAME}" ]; then
+    _num_of_package_=`$LS ${PACKAGE_DIR}/${PACKAGE_NAME}*.pkg | $WC -l | $TR -d ' '`
+    if [ ${_num_of_package_} -ne 1 ]; then
+       crash_script "Found ${_num_of_package_} package for ${PACKAGE_NAME} in ${PACKAGE_DIR}."
+    else
+       INSTALL_PACKAGE=`$LS ${PACKAGE_DIR}/${PACKAGE_NAME}*.pkg`
+    fi
+else
+    INSTALL_PACKAGE=${PACKAGE_DIR}/${INSTALL_PACKAGE_NAME}
+ fi
+
+if [ ! -f "${INSTALL_PACKAGE}" ]; then
+   crash_script "Unable to find the package ${INSTALL_PACKAGE}."
+fi
+
+validate_install_package
+
+# Install -  Install the specified package.
+# Upgrade -  Install the specified package if the version in it is greater than the current version.
+
+if [ "${INSTALL}" ];then
+   info_msg "Installation of the $PACKAGE_NAME package started."
+elif [ "${UPGRADE}" ]; then
+   _new_package_version_=`$HEAD $INSTALL_PACKAGE | $GREP -i version | $AWK -F"=" '{print $NF}'`
+   info_msg "Version of $PACKAGE_NAME package in $INSTALL_PACKAGE is ${_new_package_version_}."
+   _install_package_version_=""
+   $PKGINFO -q $PACKAGE_NAME
+   if [ $? -eq 0 ]; then
+      _install_package_version_=`$PKGINFO -l $PACKAGE_NAME | $GREP -i version | $AWK -F":" '{print $NF}' | $TR -d ' '`
+      info_msg "Current installed version of $PACKAGE_NAME package is ${_install_package_version_}"
+   fi
+   validate_package_version ${_new_package_version_} ${_install_package_version_}
+   if [ $SKIP_UPGRADE = 1 ]; then
+      exit 0
+   fi
+fi
+
+create_tmp_file
+remove_package
+add_package
+cleanup_tmp_file
+
+exit 0
